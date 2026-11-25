@@ -15,6 +15,7 @@ except ImportError:
 
 FIREBASE_DB_URL = "https://garazas-40bc3-default-rtdb.europe-west1.firebasedatabase.app"
 POLL_INTERVAL_SEC = 2.0
+TG_SEND_DELAY_SEC = 5.0
 
 TELEGRAM_BOT_TOKEN = "9140007116:AAHGyYJ0n3RH-4TcAvItMh6_jYv6B0D48pQ"
 TELEGRAM_CHAT_IDS: list[str] = ["613542160", "6285645972"]
@@ -295,7 +296,9 @@ def main(page: ft.Page):
         "swipe_dx": 0.0,
         "in_app": False,
         "stop_sync": False,
+        "tg_seq": 0,
     }
+    tg_lock = threading.Lock()
 
     name_input = ft.TextField(
         label="Tavo vardas",
@@ -532,9 +535,29 @@ def main(page: ft.Page):
         task_dialog.open = False
         page.update()
 
-    def dispatch_telegram_feedback(tg_text: str):
+    def schedule_delayed_telegram(tg_text: str):
+        with tg_lock:
+            state["tg_seq"] += 1
+            my_seq = state["tg_seq"]
+
+        tg_badge.value = f"TG: laukiama {int(TG_SEND_DELAY_SEC)}s..."
+        tg_badge.color = "#fde68a"
+        try:
+            tg_badge.update()
+        except Exception:
+            pass
+
         def _worker():
+            time.sleep(TG_SEND_DELAY_SEC)
+            if state["stop_sync"]:
+                return
+            with tg_lock:
+                if my_seq != state["tg_seq"]:
+                    return
             ok, info = send_telegram_now(tg_text)
+            with tg_lock:
+                if my_seq != state["tg_seq"]:
+                    return
             tg_badge.value = f"TG: {info}"
             tg_badge.color = "#86efac" if ok else "#fca5a5"
             try:
@@ -553,13 +576,7 @@ def main(page: ft.Page):
         render_schedule()
         if tg_msg:
             full_tg = f"[{sanitize_room(state['room'])}] {tg_msg}"
-            tg_badge.value = "TG: siunčiama..."
-            tg_badge.color = "#fde68a"
-            try:
-                tg_badge.update()
-            except Exception:
-                pass
-            dispatch_telegram_feedback(full_tg)
+            schedule_delayed_telegram(full_tg)
         notify_user(snack_msg, highlight=False)
 
     def save_task_click(e):
@@ -1017,8 +1034,16 @@ def main(page: ft.Page):
             state["swipe_dx"] = 0.0
 
         def on_pan_update(e: ft.DragUpdateEvent):
-            if e.delta_x is not None:
-                state["swipe_dx"] += e.delta_x
+            dx = 0.0
+            local_delta = getattr(e, "local_delta", None)
+            global_delta = getattr(e, "global_delta", None)
+            if local_delta is not None and getattr(local_delta, "x", None) is not None:
+                dx = float(local_delta.x)
+            elif global_delta is not None and getattr(global_delta, "x", None) is not None:
+                dx = float(global_delta.x)
+            elif getattr(e, "delta_x", None) is not None:
+                dx = float(e.delta_x)
+            state["swipe_dx"] += dx
 
         def on_pan_end(e: ft.DragEndEvent):
             if state["swipe_dx"] < -60:
