@@ -174,21 +174,37 @@ def cloud_push_tasks(room_code: str, tasks: list[dict]) -> bool:
         return False
 
 
-def send_telegram_async(text: str) -> None:
+def send_telegram_now(text: str) -> tuple[bool, str]:
     token = TELEGRAM_BOT_TOKEN.strip()
     chat_ids = [str(c).strip() for c in TELEGRAM_CHAT_IDS if str(c).strip()]
-    if not token or not chat_ids or requests is None:
-        return
+    if not token or not chat_ids:
+        return False, "Trūksta Telegram token arba chat_id"
+    if requests is None:
+        return False, "Trūksta requests modulio"
 
-    def _worker():
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        for cid in chat_ids:
-            try:
-                requests.post(url, json={"chat_id": cid, "text": text}, timeout=6)
-            except Exception:
-                pass
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    ok_count = 0
+    errors = []
 
-    threading.Thread(target=_worker, daemon=True).start()
+    for cid in chat_ids:
+        try:
+            resp = requests.post(url, json={"chat_id": cid, "text": text}, timeout=8)
+            if resp.status_code == 200:
+                ok_count += 1
+            else:
+                try:
+                    desc = resp.json().get("description", resp.text)
+                except Exception:
+                    desc = resp.text
+                errors.append(f"{cid}: {desc[:60]}")
+        except Exception as exc:
+            errors.append(f"{cid}: {str(exc)[:60]}")
+
+    if ok_count > 0 and not errors:
+        return True, f"TG išsiųsta ({ok_count})"
+    if ok_count > 0:
+        return True, f"TG išsiųsta ({ok_count}), klaida: {', '.join(errors)}"
+    return False, f"TG klaida: {', '.join(errors)}"
 
 
 def diff_remote_changes(old_tasks: list[dict], new_tasks: list[dict], current_user: str) -> list[str]:
@@ -255,10 +271,10 @@ def selectable_slots(include_extra: bool) -> list[str]:
 
 def slot_tag(slot: str) -> str:
     if slot in extra_morning_slots():
-        return "Papildomas (nuo 08:00)"
+        return "Papildomas"
     if slot in extra_evening_slots():
-        return "Papildomas (17:00–19:00+)"
-    return "Darbo laikas (09:00–17:00)"
+        return "Vakarinis"
+    return "Darbo"
 
 
 def main(page: ft.Page):
@@ -297,8 +313,9 @@ def main(page: ft.Page):
     header_title = ft.Text("", size=18, weight=ft.FontWeight.BOLD, color="#ffffff")
     header_sub = ft.Text("", size=12, color="#93c5fd")
     sync_badge = ft.Text("", size=11, color="#86efac")
-    date_label = ft.Text("", size=14, weight=ft.FontWeight.W_600, color="#0f172a")
-    alert_banner_text = ft.Text("", size=13, weight=ft.FontWeight.W_600, color="#7c2d12")
+    tg_badge = ft.Text("TG: laukia", size=11, color="#cbd5e1")
+    date_label = ft.Text("", size=13, weight=ft.FontWeight.W_600, color="#0f172a")
+    alert_banner_text = ft.Text("", size=13, weight=ft.FontWeight.W_600, color="#7c2d12", expand=True)
     alert_banner = ft.Container(
         visible=False,
         padding=ft.Padding.symmetric(horizontal=14, vertical=8),
@@ -315,9 +332,9 @@ def main(page: ft.Page):
     slots_column = ft.Column(spacing=8, expand=True)
 
     m_date = ft.TextField(label="Data (MMMM-MM-DD)", value=today_str(), border_radius=10)
-    m_time = ft.Dropdown(label="Pradžios laikas (tik laisvi)", options=[], border_radius=10)
+    m_time = ft.Dropdown(label="Pradžios laikas", options=[], border_radius=10)
     m_duration = ft.Dropdown(
-        label="Kiek užtruks darbas",
+        label="Trukmė",
         options=[ft.dropdown.Option(str(mins), label) for mins, label in DURATION_OPTIONS],
         value="60",
         border_radius=10,
@@ -341,9 +358,9 @@ def main(page: ft.Page):
     )
     modal_error = ft.Text("", color="#b91c1c", size=12)
 
-    st_btn_planned = ft.Button("Suplanuota", height=36)
-    st_btn_arrived = ft.Button("Atvyko", height=36)
-    st_btn_done = ft.Button("Atlikta", height=36)
+    st_btn_planned = ft.Button("Suplanuota", height=34)
+    st_btn_arrived = ft.Button("Atvyko", height=34)
+    st_btn_done = ft.Button("Atlikta", height=34)
 
     def hide_banner():
         alert_banner.visible = False
@@ -382,7 +399,8 @@ def main(page: ft.Page):
             btn.bgcolor = bg if selected else "#f8fafc"
             btn.color = fg if selected else "#475569"
             btn.style = ft.ButtonStyle(
-                side=ft.BorderSide(2 if selected else 1, fg if selected else border_col)
+                padding=ft.Padding.symmetric(horizontal=10, vertical=4),
+                side=ft.BorderSide(2 if selected else 1, fg if selected else border_col),
             )
 
     def set_modal_status(key: str):
@@ -456,7 +474,7 @@ def main(page: ft.Page):
                 continue
             valid_start_times.append(s)
 
-        m_time.options = [ft.dropdown.Option(s, f"{s} • {slot_tag(s)}") for s in valid_start_times]
+        m_time.options = [ft.dropdown.Option(s, f"{s} ({slot_tag(s)})") for s in valid_start_times]
 
         if valid_start_times:
             chosen_start = preferred_time if preferred_time in valid_start_times else valid_start_times[0]
@@ -514,13 +532,34 @@ def main(page: ft.Page):
         task_dialog.open = False
         page.update()
 
+    def dispatch_telegram_feedback(tg_text: str):
+        def _worker():
+            ok, info = send_telegram_now(tg_text)
+            tg_badge.value = f"TG: {info}"
+            tg_badge.color = "#86efac" if ok else "#fca5a5"
+            try:
+                tg_badge.update()
+            except Exception:
+                pass
+            if not ok:
+                notify_user(info, highlight=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def persist_tasks(updated_tasks: list[dict], snack_msg: str, tg_msg: str | None = None):
         state["tasks"] = updated_tasks
         synced = cloud_push_tasks(state["room"], state["tasks"])
         sync_badge.value = "● Sinchronizuota (Firebase)" if synced else "● Vietinis režimas"
-        if tg_msg:
-            send_telegram_async(f"[{sanitize_room(state['room'])}] {tg_msg}")
         render_schedule()
+        if tg_msg:
+            full_tg = f"[{sanitize_room(state['room'])}] {tg_msg}"
+            tg_badge.value = "TG: siunčiama..."
+            tg_badge.color = "#fde68a"
+            try:
+                tg_badge.update()
+            except Exception:
+                pass
+            dispatch_telegram_feedback(full_tg)
         notify_user(snack_msg, highlight=False)
 
     def save_task_click(e):
@@ -571,6 +610,7 @@ def main(page: ft.Page):
 
         existing_item = next((t for t in state["tasks"] if t.get("id") == task_id), None)
         creator = existing_item.get("by") if existing_item else state["user"]
+        st_label = STATUS_INFO.get(state["status"], STATUS_INFO["planned"])[0]
 
         record = {
             "id": task_id,
@@ -601,7 +641,10 @@ def main(page: ft.Page):
         task_dialog.open = False
         action_verb = "atnaujino" if existing_item else "pridėjo"
         phone_part = f", tel. {phone}" if phone else ""
-        tg_text = f"{state['user']} {action_verb}: {client}{phone_part} ({chosen_date} {chosen_time}, {duration_label(duration_mins)})"
+        tg_text = (
+            f"{state['user']} {action_verb}: {client}{phone_part} "
+            f"({chosen_date} {chosen_time}, {duration_label(duration_mins)}, {st_label})"
+        )
         persist_tasks(next_tasks, "Įrašas išsaugotas.", tg_msg=tg_text)
 
     def delete_task_click(e):
@@ -625,11 +668,13 @@ def main(page: ft.Page):
 
     task_dialog = ft.AlertDialog(
         modal=True,
-        title=ft.Text("Darbo įrašas"),
+        inset_padding=ft.Padding.symmetric(horizontal=14, vertical=18),
+        title=ft.Text("Darbo įrašas", size=18, weight=ft.FontWeight.BOLD),
         content=ft.Container(
-            width=370,
+            width=340,
             content=ft.Column(
                 tight=True,
+                scroll=ft.ScrollMode.AUTO,
                 spacing=10,
                 controls=[
                     m_date,
@@ -640,15 +685,33 @@ def main(page: ft.Page):
                     m_phone,
                     m_notes,
                     ft.Text("Būsena:", size=12, weight=ft.FontWeight.W_600, color="#475569"),
-                    ft.Row(spacing=6, controls=[st_btn_planned, st_btn_arrived, st_btn_done]),
+                    ft.Row(
+                        wrap=True,
+                        run_spacing=6,
+                        spacing=6,
+                        controls=[st_btn_planned, st_btn_arrived, st_btn_done],
+                    ),
                     modal_error,
                 ],
             ),
         ),
         actions=[
-            delete_btn,
-            ft.Button("Atšaukti", on_click=close_modal),
-            ft.Button("Išsaugoti", bgcolor="#2563eb", color="#ffffff", on_click=save_task_click),
+            ft.Row(
+                wrap=True,
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                run_spacing=8,
+                spacing=8,
+                controls=[
+                    delete_btn,
+                    ft.Row(
+                        spacing=8,
+                        controls=[
+                            ft.Button("Atšaukti", on_click=close_modal),
+                            ft.Button("Išsaugoti", bgcolor="#2563eb", color="#ffffff", on_click=save_task_click),
+                        ],
+                    ),
+                ],
+            )
         ],
     )
     page.overlay.append(task_dialog)
@@ -658,7 +721,7 @@ def main(page: ft.Page):
         if existing:
             state["edit_id"] = existing.get("id")
             state["status"] = existing.get("status", "planned")
-            task_dialog.title = ft.Text("Koreguoti įrašą")
+            task_dialog.title = ft.Text("Koreguoti įrašą", size=18, weight=ft.FontWeight.BOLD)
             target_d = existing.get("date", state["date"])
             m_date.value = target_d
             m_client.value = existing.get("client", "")
@@ -674,7 +737,7 @@ def main(page: ft.Page):
         else:
             state["edit_id"] = None
             state["status"] = "planned"
-            task_dialog.title = ft.Text("Naujas užsakymas")
+            task_dialog.title = ft.Text("Naujas užsakymas", size=18, weight=ft.FontWeight.BOLD)
             target_d = state["date"]
             m_date.value = target_d
             m_client.value = ""
@@ -862,7 +925,7 @@ def main(page: ft.Page):
     def render_schedule():
         header_title.value = f"GRAFIKAS • {sanitize_room(state['room'])}"
         header_sub.value = f"Naudotojas: {state['user']}"
-        date_label.value = f"Data: {state['date']}  (braukite į šoną keisti dienai)"
+        date_label.value = f"Data: {state['date']}  (braukite keisti dienai)"
 
         day_items = [t for t in state["tasks"] if t.get("date") == state["date"]]
         starts_by_slot: dict[str, list[dict]] = {}
@@ -975,7 +1038,7 @@ def main(page: ft.Page):
             on_horizontal_drag_update=on_pan_update,
             on_horizontal_drag_end=on_pan_end,
             content=ft.Container(
-                padding=12,
+                padding=ft.Padding.only(left=12, right=12, top=12, bottom=88),
                 content=slots_column,
             ),
         )
@@ -992,7 +1055,7 @@ def main(page: ft.Page):
                             ft.Row(
                                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                 controls=[
-                                    ft.Column(spacing=2, controls=[header_title, header_sub, sync_badge]),
+                                    ft.Column(spacing=2, controls=[header_title, header_sub, sync_badge, tg_badge]),
                                     ft.Button(
                                         "Keisti",
                                         bgcolor="#1e293b",
