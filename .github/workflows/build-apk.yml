@@ -29,7 +29,7 @@ jobs:
 
       - name: Build APK with Flet
         run: |
-          flet build apk \
+          flet build apk -y \
             --org lt.garazas \
             --project darbu-grafikas \
             --build-number ${{ github.run_number }} \
