@@ -371,22 +371,30 @@ def main(page: ft.Page):
             notify_user("Nėra išsaugoto telefono numerio.", highlight=False)
             return
 
+        copied = False
         try:
-            page.set_clipboard(tel)
+            res = page.set_clipboard(tel)
+            if hasattr(res, "__await__"):
+                await res
+            copied = True
         except Exception:
-            pass
+            copied = False
 
         launched = False
         try:
-            await page.launch_url(f"tel:{tel}")
+            launch_res = page.launch_url(f"tel:{tel}")
+            if hasattr(launch_res, "__await__"):
+                await launch_res
             launched = True
         except Exception:
             launched = False
 
-        if not launched:
-            notify_user(f"Nukopijuota: {tel} (rinkiklis neatsidarė)", highlight=True)
-        else:
+        if launched and copied:
             notify_user(f"Nukopijuota: {tel}", highlight=False)
+        elif copied:
+            notify_user(f"Nukopijuota: {tel} (rinkiklio neatidarė – įklijuokite rankiniu būdu)", highlight=True)
+        else:
+            notify_user(f"Nepavyko nukopijuoti. Numeris: {tel}", highlight=True)
 
     def refresh_status_buttons():
         mapping = {
