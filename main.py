@@ -382,7 +382,8 @@ def main(page: ft.Page):
 
         launched = False
         try:
-            launch_res = page.launch_url(f"tel:{tel}")
+            launcher = ft.UrlLauncher()
+            launch_res = launcher.launch_url(f"tel:{tel}")
             if hasattr(launch_res, "__await__"):
                 await launch_res
             launched = True
@@ -391,10 +392,12 @@ def main(page: ft.Page):
 
         if launched and copied:
             notify_user(f"Nukopijuota: {tel}", highlight=False)
+        elif launched:
+            notify_user(f"Atidaromas rinkiklis: {tel}", highlight=False)
         elif copied:
-            notify_user(f"Nukopijuota: {tel} (rinkiklio neatidarė – įklijuokite rankiniu būdu)", highlight=True)
+            notify_user(f"Nukopijuota: {tel} (rinkiklio neatidarė)", highlight=True)
         else:
-            notify_user(f"Nepavyko nukopijuoti. Numeris: {tel}", highlight=True)
+            notify_user(f"Numeris: {tel}", highlight=True)
 
     def refresh_status_buttons():
         mapping = {
