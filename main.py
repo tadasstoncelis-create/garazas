@@ -22,15 +22,6 @@ TELEGRAM_CHAT_IDS: list[str] = ["613542160", "6285645972"]
 
 LUNCH_SLOTS = {"13:00", "13:30"}
 
-DURATION_OPTIONS = [
-    (30, "30 min"),
-    (60, "1 val"),
-    (90, "1,5 val"),
-    (120, "2 val"),
-    (180, "3 val"),
-    (240, "4 val"),
-]
-
 STATUS_CYCLE = ["planned", "arrived", "done"]
 STATUS_INFO = {
     "planned": ("Suplanuota", "#dbeafe", "#1e40af", "#93c5fd"),
@@ -71,12 +62,6 @@ def time_to_minutes(time_text: str) -> int:
     return h * 60 + m
 
 
-def minutes_to_time(mins: int) -> str:
-    h = mins // 60
-    m = mins % 60
-    return f"{h:02d}:{m:02d}"
-
-
 def current_slot_minutes() -> int:
     now = datetime.now()
     now_mins = now.hour * 60 + now.minute
@@ -88,21 +73,6 @@ def clean_phone(phone_text: str) -> str:
     if cleaned.startswith("00"):
         cleaned = "+" + cleaned[2:]
     return cleaned
-
-
-def occupied_slots_for_task(task: dict) -> set[str]:
-    start_str = task.get("time") or "09:00"
-    duration = int(task.get("duration", 30) or 30)
-    steps = max(1, duration // 30)
-    start_m = time_to_minutes(start_str)
-    return {minutes_to_time(start_m + i * 30) for i in range(steps)}
-
-
-def duration_label(minutes: int) -> str:
-    for mins, label in DURATION_OPTIONS:
-        if mins == minutes:
-            return label
-    return f"{minutes} min"
 
 
 def sanitize_room(room_code: str) -> str:
@@ -168,7 +138,7 @@ def cloud_push_tasks(room_code: str, tasks: list[dict]) -> bool:
         return False
     try:
         payload = {t["id"]: t for t in tasks if t.get("id")}
-        resp = requests.put(firebase_room_url(room_code), json=payload, timeout=6)
+        resp = requests.put(firebase_room_url(room_code), json=payload, timeout=8)
         resp.raise_for_status()
         return True
     except Exception:
@@ -229,11 +199,7 @@ def diff_remote_changes(old_tasks: list[dict], new_tasks: list[dict], current_us
             old_t = old_map[tid]
             if old_t.get("status") != new_t.get("status"):
                 messages.append(f"{actor} pakeitė būseną į „{st_label}“: {client} ({t_time})")
-            elif (
-                old_t.get("time") != new_t.get("time")
-                or old_t.get("date") != new_t.get("date")
-                or old_t.get("duration") != new_t.get("duration")
-            ):
+            elif old_t.get("time") != new_t.get("time") or old_t.get("date") != new_t.get("date"):
                 messages.append(f"{actor} perkėlė laiką: {client} -> {t_date} {t_time}")
             elif old_t != new_t:
                 messages.append(f"{actor} atnaujino: {client} ({t_time})")
@@ -297,8 +263,11 @@ def main(page: ft.Page):
         "in_app": False,
         "stop_sync": False,
         "tg_seq": 0,
+        "push_seq": 0,
+        "is_saving": False,
     }
     tg_lock = threading.Lock()
+    push_lock = threading.Lock()
 
     name_input = ft.TextField(
         label="Tavo vardas",
@@ -335,14 +304,7 @@ def main(page: ft.Page):
     slots_column = ft.Column(spacing=8, expand=True)
 
     m_date = ft.TextField(label="Data (MMMM-MM-DD)", value=today_str(), border_radius=10)
-    m_time = ft.Dropdown(label="Pradžios laikas", options=[], border_radius=10)
-    m_duration = ft.Dropdown(
-        label="Trukmė",
-        options=[ft.dropdown.Option(str(mins), label) for mins, label in DURATION_OPTIONS],
-        value="60",
-        border_radius=10,
-    )
-    m_preview = ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#1e40af")
+    m_time = ft.Dropdown(label="Laikas", options=[], border_radius=10)
     m_client = ft.TextField(
         label="Klientas / Automobilis *",
         border_radius=10,
@@ -384,10 +346,20 @@ def main(page: ft.Page):
         if not tel:
             notify_user("Nėra išsaugoto telefono numerio.", highlight=False)
             return
+
+        launched = False
         try:
             await page.launch_url(f"tel:{tel}")
+            launched = True
         except Exception:
-            notify_user(f"Numeris: {tel}", highlight=False)
+            launched = False
+
+        if not launched:
+            try:
+                page.set_clipboard(tel)
+            except Exception:
+                pass
+            notify_user(f"Numeris: {tel}", highlight=True)
 
     def refresh_status_buttons():
         mapping = {
@@ -418,43 +390,11 @@ def main(page: ft.Page):
     def get_blocked_slots(target_date: str, ignore_id: str | None = None) -> set[str]:
         blocked = set(LUNCH_SLOTS)
         for t in state["tasks"]:
-            if t.get("date") == target_date and t.get("id") != ignore_id:
-                blocked |= occupied_slots_for_task(t)
+            if t.get("date") == target_date and t.get("id") != ignore_id and t.get("time"):
+                blocked.add(t["time"])
         return blocked
 
-    def max_available_minutes(start_time: str, blocked: set[str]) -> int:
-        start_m = time_to_minutes(start_time)
-        max_end_m = 20 * 60
-        steps = 0
-        while True:
-            slot_m = start_m + steps * 30
-            if slot_m >= max_end_m:
-                break
-            if minutes_to_time(slot_m) in blocked:
-                break
-            steps += 1
-        return max(30, steps * 30)
-
-    def can_fit_duration(start_time: str, duration_mins: int, blocked: set[str]) -> bool:
-        return duration_mins <= max_available_minutes(start_time, blocked)
-
-    def update_preview_text(start_time: str | None, duration_mins: int, blocked: set[str]):
-        if not start_time:
-            m_preview.value = "Šią dieną tinkamų laisvų laikų nebėra."
-            m_preview.color = "#b91c1c"
-            return
-        end_t = minutes_to_time(time_to_minutes(start_time) + duration_mins)
-        max_m = max_available_minutes(start_time, blocked)
-        max_end_t = minutes_to_time(time_to_minutes(start_time) + max_m)
-        tag = slot_tag(start_time)
-        if max_m < 240:
-            m_preview.value = f"{tag}: {start_time}–{end_t} (maks. iki {max_end_t})"
-            m_preview.color = "#b45309"
-        else:
-            m_preview.value = f"{tag}: {start_time}–{end_t}"
-            m_preview.color = "#1e40af"
-
-    def refresh_time_and_duration(target_date: str, preferred_time: str | None, preferred_duration: int, ignore_id: str | None):
+    def refresh_time_options(target_date: str, preferred_time: str | None, ignore_id: str | None):
         blocked = get_blocked_slots(target_date, ignore_id)
         include_extra = state["show_extra"] or (
             preferred_time is not None and preferred_time not in work_slots()
@@ -484,54 +424,29 @@ def main(page: ft.Page):
             m_time.value = chosen_start
             m_time.disabled = False
         else:
-            chosen_start = None
             m_time.value = None
             m_time.disabled = True
 
-        valid_durations = []
-        if chosen_start:
-            allowed_max = max_available_minutes(chosen_start, blocked)
-            for mins, label in DURATION_OPTIONS:
-                if mins <= allowed_max:
-                    valid_durations.append((mins, label))
-
-        if not valid_durations:
-            valid_durations = [(30, "30 min")]
-
-        m_duration.options = [ft.dropdown.Option(str(mins), label) for mins, label in valid_durations]
-        allowed_mins = [mins for mins, _ in valid_durations]
-        chosen_dur = preferred_duration if preferred_duration in allowed_mins else allowed_mins[-1]
-        m_duration.value = str(chosen_dur)
-
-        update_preview_text(chosen_start, chosen_dur, blocked)
-
         try:
             m_time.update()
-            m_duration.update()
-            m_preview.update()
         except Exception:
             pass
 
-    def on_modal_inputs_change(e):
+    def on_modal_date_change(e):
         chosen = (m_date.value or "").strip()
         try:
             datetime.strptime(chosen, "%Y-%m-%d")
             modal_error.value = ""
-            refresh_time_and_duration(
-                chosen,
-                m_time.value,
-                int(m_duration.value or "60"),
-                state["edit_id"],
-            )
+            refresh_time_options(chosen, m_time.value, state["edit_id"])
         except ValueError:
             pass
         page.update()
 
-    m_date.on_change = on_modal_inputs_change
-    m_time.on_change = on_modal_inputs_change
-    m_duration.on_change = on_modal_inputs_change
+    m_date.on_change = on_modal_date_change
 
     def close_modal(e=None):
+        state["is_saving"] = False
+        save_btn.disabled = False
         task_dialog.open = False
         page.update()
 
@@ -569,10 +484,32 @@ def main(page: ft.Page):
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    def push_tasks_async(room_code: str, snapshot: list[dict]):
+        with push_lock:
+            state["push_seq"] += 1
+            my_push_seq = state["push_seq"]
+
+        sync_badge.value = "● Saugoma..."
+        sync_badge.color = "#fde68a"
+
+        def _push_worker():
+            save_local_tasks(room_code, snapshot)
+            synced = cloud_push_tasks(room_code, snapshot)
+            with push_lock:
+                if my_push_seq != state["push_seq"]:
+                    return
+            sync_badge.value = "● Sinchronizuota (Firebase)" if synced else "● Vietinis režimas"
+            sync_badge.color = "#86efac" if synced else "#fca5a5"
+            try:
+                sync_badge.update()
+            except Exception:
+                pass
+
+        threading.Thread(target=_push_worker, daemon=True).start()
+
     def persist_tasks(updated_tasks: list[dict], snack_msg: str, tg_msg: str | None = None):
         state["tasks"] = updated_tasks
-        synced = cloud_push_tasks(state["room"], state["tasks"])
-        sync_badge.value = "● Sinchronizuota (Firebase)" if synced else "● Vietinis režimas"
+        push_tasks_async(state["room"], list(updated_tasks))
         render_schedule()
         if tg_msg:
             full_tg = f"[{sanitize_room(state['room'])}] {tg_msg}"
@@ -580,11 +517,13 @@ def main(page: ft.Page):
         notify_user(snack_msg, highlight=False)
 
     def save_task_click(e):
+        if state["is_saving"] or not task_dialog.open:
+            return
+
         client = (m_client.value or "").strip()
         phone = (m_phone.value or "").strip()
         chosen_date = (m_date.value or "").strip()
         chosen_time = m_time.value
-        duration_mins = int(m_duration.value or "60")
         notes = (m_notes.value or "").strip()
 
         if not client:
@@ -612,19 +551,15 @@ def main(page: ft.Page):
         if state["edit_id"] is None and chosen_date == today_str():
             if time_to_minutes(chosen_time) < current_slot_minutes():
                 modal_error.value = "Naują įrašą šiandien galima daryti tik nuo esamo laiko ir į priekį."
-                refresh_time_and_duration(chosen_date, None, duration_mins, None)
+                refresh_time_options(chosen_date, None, None)
                 page.update()
                 return
 
+        state["is_saving"] = True
+        save_btn.disabled = True
+        task_dialog.open = False
+
         task_id = state["edit_id"] or f"t_{int(datetime.now().timestamp() * 1000)}"
-        blocked = get_blocked_slots(chosen_date, task_id)
-
-        if not can_fit_duration(chosen_time, duration_mins, blocked):
-            modal_error.value = "Vėliau šią dieną jau yra užsakymas arba pietų laikas – pasirinkite trumpesnę trukmę."
-            refresh_time_and_duration(chosen_date, chosen_time, 30, task_id)
-            page.update()
-            return
-
         existing_item = next((t for t in state["tasks"] if t.get("id") == task_id), None)
         creator = existing_item.get("by") if existing_item else state["user"]
         st_label = STATUS_INFO.get(state["status"], STATUS_INFO["planned"])[0]
@@ -633,7 +568,6 @@ def main(page: ft.Page):
             "id": task_id,
             "date": chosen_date,
             "time": chosen_time,
-            "duration": duration_mins,
             "client": client,
             "phone": phone,
             "notes": notes,
@@ -655,21 +589,23 @@ def main(page: ft.Page):
             next_tasks.append(record)
 
         state["date"] = chosen_date
-        task_dialog.open = False
         action_verb = "atnaujino" if existing_item else "pridėjo"
         phone_part = f", tel. {phone}" if phone else ""
         tg_text = (
             f"{state['user']} {action_verb}: {client}{phone_part} "
-            f"({chosen_date} {chosen_time}, {duration_label(duration_mins)}, {st_label})"
+            f"({chosen_date} {chosen_time}, {st_label})"
         )
         persist_tasks(next_tasks, "Įrašas išsaugotas.", tg_msg=tg_text)
 
     def delete_task_click(e):
-        if not state["edit_id"]:
+        if state["is_saving"] or not state["edit_id"]:
             return
+        state["is_saving"] = True
+        save_btn.disabled = True
+        task_dialog.open = False
+
         removed = next((t for t in state["tasks"] if t.get("id") == state["edit_id"]), None)
         next_tasks = [t for t in state["tasks"] if t.get("id") != state["edit_id"]]
-        task_dialog.open = False
         rem_client = removed.get("client", "Užsakymas") if removed else "Užsakymas"
         rem_date = removed.get("date", "") if removed else ""
         rem_time = removed.get("time", "") if removed else ""
@@ -681,6 +617,12 @@ def main(page: ft.Page):
         bgcolor="#fee2e2",
         color="#b91c1c",
         on_click=delete_task_click,
+    )
+    save_btn = ft.Button(
+        "Išsaugoti",
+        bgcolor="#2563eb",
+        color="#ffffff",
+        on_click=save_task_click,
     )
 
     task_dialog = ft.AlertDialog(
@@ -696,8 +638,6 @@ def main(page: ft.Page):
                 controls=[
                     m_date,
                     m_time,
-                    m_duration,
-                    m_preview,
                     m_client,
                     m_phone,
                     m_notes,
@@ -724,7 +664,7 @@ def main(page: ft.Page):
                         spacing=8,
                         controls=[
                             ft.Button("Atšaukti", on_click=close_modal),
-                            ft.Button("Išsaugoti", bgcolor="#2563eb", color="#ffffff", on_click=save_task_click),
+                            save_btn,
                         ],
                     ),
                 ],
@@ -734,6 +674,8 @@ def main(page: ft.Page):
     page.overlay.append(task_dialog)
 
     def open_task_modal(slot_time: str | None = None, existing: dict | None = None):
+        state["is_saving"] = False
+        save_btn.disabled = False
         modal_error.value = ""
         if existing:
             state["edit_id"] = existing.get("id")
@@ -744,10 +686,9 @@ def main(page: ft.Page):
             m_client.value = existing.get("client", "")
             m_phone.value = existing.get("phone", "")
             m_notes.value = existing.get("notes", "")
-            refresh_time_and_duration(
+            refresh_time_options(
                 target_d,
                 existing.get("time", slot_time),
-                int(existing.get("duration", 60) or 60),
                 state["edit_id"],
             )
             delete_btn.visible = True
@@ -760,7 +701,7 @@ def main(page: ft.Page):
             m_client.value = ""
             m_phone.value = ""
             m_notes.value = ""
-            refresh_time_and_duration(target_d, slot_time, 60, None)
+            refresh_time_options(target_d, slot_time, None)
             delete_btn.visible = False
 
         refresh_status_buttons()
@@ -812,7 +753,7 @@ def main(page: ft.Page):
             content=ft.Text(title, size=12, weight=ft.FontWeight.BOLD, color=fg),
         )
 
-    def build_slot_row(slot: str, starts_by_slot: dict[str, list[dict]], continuation_owner: dict[str, dict], is_extra: bool):
+    def build_slot_row(slot: str, starts_by_slot: dict[str, list[dict]], is_extra: bool):
         matched = starts_by_slot.get(slot, [])
         if matched:
             row_controls = []
@@ -822,8 +763,6 @@ def main(page: ft.Page):
                     st_key = "planned"
                 st_label, st_bg, st_fg, st_border = STATUS_INFO[st_key]
                 is_done = st_key == "done"
-                dur_mins = int(item.get("duration", 30) or 30)
-                end_t = minutes_to_time(time_to_minutes(slot) + dur_mins)
                 phone_val = (item.get("phone") or "").strip()
 
                 action_row_items = [
@@ -859,7 +798,7 @@ def main(page: ft.Page):
                                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                     controls=[
                                         ft.Text(
-                                            f"{slot}–{end_t} ({duration_label(dur_mins)})",
+                                            slot,
                                             weight=ft.FontWeight.BOLD,
                                             size=14,
                                             color="#0f172a",
@@ -901,26 +840,6 @@ def main(page: ft.Page):
                 )
             return row_controls
 
-        if slot in continuation_owner:
-            owner = continuation_owner[slot]
-            return [
-                ft.Container(
-                    padding=10,
-                    border_radius=12,
-                    bgcolor="#e2e8f0",
-                    border=ft.Border.all(1, "#cbd5e1"),
-                    on_click=lambda e, rec=owner: open_task_modal(rec.get("time", "09:00"), rec),
-                    content=ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        controls=[
-                            ft.Text(slot, weight=ft.FontWeight.BOLD, color="#475569"),
-                            ft.Text(f"Užimta: {owner.get('client', '')}", size=12, color="#334155"),
-                            ft.Text("Koreguoti", size=11, color="#1d4ed8"),
-                        ],
-                    ),
-                )
-            ]
-
         return [
             ft.Container(
                 padding=12,
@@ -946,44 +865,39 @@ def main(page: ft.Page):
 
         day_items = [t for t in state["tasks"] if t.get("date") == state["date"]]
         starts_by_slot: dict[str, list[dict]] = {}
-        continuation_owner: dict[str, dict] = {}
 
         for item in day_items:
             start_t = item.get("time") or "09:00"
             starts_by_slot.setdefault(start_t, []).append(item)
-            for covered in occupied_slots_for_task(item):
-                if covered != start_t and covered not in continuation_owner:
-                    continuation_owner[covered] = item
 
-        occupied_all = set(starts_by_slot.keys()) | set(continuation_owner.keys())
-
+        occupied_all = set(starts_by_slot.keys())
         controls = []
 
         if state["show_extra"]:
             controls.append(section_divider("PAPILDOMAS LAIKAS (NUO 08:00)", "#fef3c7", "#92400e"))
             for slot in extra_morning_slots():
-                controls.extend(build_slot_row(slot, starts_by_slot, continuation_owner, is_extra=True))
+                controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
         else:
             active_morning = [s for s in extra_morning_slots() if s in occupied_all]
             if active_morning:
                 controls.append(section_divider("PAPILDOMAS LAIKAS (NUO 08:00)", "#fef3c7", "#92400e"))
                 for slot in active_morning:
-                    controls.extend(build_slot_row(slot, starts_by_slot, continuation_owner, is_extra=True))
+                    controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
 
         controls.append(section_divider("DARBO LAIKAS (09:00–17:00, PIETŪS 13:00–14:00)", "#dbeafe", "#1e40af"))
         for slot in work_slots():
-            controls.extend(build_slot_row(slot, starts_by_slot, continuation_owner, is_extra=False))
+            controls.extend(build_slot_row(slot, starts_by_slot, is_extra=False))
 
         if state["show_extra"]:
             controls.append(section_divider("PAPILDOMAS LAIKAS (17:00–19:00)", "#fef3c7", "#92400e"))
             for slot in extra_evening_slots():
-                controls.extend(build_slot_row(slot, starts_by_slot, continuation_owner, is_extra=True))
+                controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
         else:
             active_evening = [s for s in extra_evening_slots() if s in occupied_all]
             if active_evening:
                 controls.append(section_divider("PAPILDOMAS LAIKAS (17:00–19:00)", "#fef3c7", "#92400e"))
                 for slot in active_evening:
-                    controls.extend(build_slot_row(slot, starts_by_slot, continuation_owner, is_extra=True))
+                    controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
 
         slots_column.controls = controls
         page.update()
