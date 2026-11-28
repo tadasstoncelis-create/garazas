@@ -62,10 +62,24 @@ def time_to_minutes(time_text: str) -> int:
     return h * 60 + m
 
 
-def current_slot_minutes() -> int:
+def now_minutes() -> int:
     now = datetime.now()
-    now_mins = now.hour * 60 + now.minute
-    return int(math.ceil(now_mins / 30.0) * 30)
+    return now.hour * 60 + now.minute
+
+
+def current_slot_minutes() -> int:
+    return int(math.ceil(now_minutes() / 30.0) * 30)
+
+
+def is_past_slot_for_date(target_date: str, slot_time: str) -> bool:
+    if target_date < today_str():
+        return True
+    if target_date > today_str():
+        return False
+    try:
+        return (time_to_minutes(slot_time) + 30) <= now_minutes()
+    except Exception:
+        return False
 
 
 def clean_phone(phone_text: str) -> str:
@@ -259,6 +273,7 @@ def main(page: ft.Page):
         "edit_id": None,
         "status": "planned",
         "show_extra": False,
+        "search": "",
         "swipe_dx": 0.0,
         "in_app": False,
         "stop_sync": False,
@@ -287,6 +302,13 @@ def main(page: ft.Page):
     sync_badge = ft.Text("", size=11, color="#86efac")
     tg_badge = ft.Text("TG: laukia", size=11, color="#cbd5e1")
     date_label = ft.Text("", size=13, weight=ft.FontWeight.W_600, color="#0f172a")
+    occupancy_badge = ft.Container(
+        padding=ft.Padding.symmetric(horizontal=10, vertical=5),
+        border_radius=8,
+        bgcolor="#dbeafe",
+        border=ft.Border.all(1, "#93c5fd"),
+        content=ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#1e40af"),
+    )
     alert_banner_text = ft.Text("", size=13, weight=ft.FontWeight.W_600, color="#7c2d12", expand=True)
     alert_banner = ft.Container(
         visible=False,
@@ -327,6 +349,8 @@ def main(page: ft.Page):
     st_btn_arrived = ft.Button("Atvyko", height=34)
     st_btn_done = ft.Button("Atlikta", height=34)
 
+    delete_confirm_text = ft.Text("", size=14, color="#0f172a")
+
     def hide_banner():
         alert_banner.visible = False
         try:
@@ -347,6 +371,11 @@ def main(page: ft.Page):
             notify_user("Nėra išsaugoto telefono numerio.", highlight=False)
             return
 
+        try:
+            page.set_clipboard(tel)
+        except Exception:
+            pass
+
         launched = False
         try:
             await page.launch_url(f"tel:{tel}")
@@ -355,11 +384,9 @@ def main(page: ft.Page):
             launched = False
 
         if not launched:
-            try:
-                page.set_clipboard(tel)
-            except Exception:
-                pass
-            notify_user(f"Numeris: {tel}", highlight=True)
+            notify_user(f"Nukopijuota: {tel} (rinkiklis neatsidarė)", highlight=True)
+        else:
+            notify_user(f"Nukopijuota: {tel}", highlight=False)
 
     def refresh_status_buttons():
         mapping = {
@@ -448,6 +475,10 @@ def main(page: ft.Page):
         state["is_saving"] = False
         save_btn.disabled = False
         task_dialog.open = False
+        page.update()
+
+    def close_delete_confirm(e=None):
+        delete_dialog.open = False
         page.update()
 
     def schedule_delayed_telegram(tg_text: str):
@@ -597,11 +628,12 @@ def main(page: ft.Page):
         )
         persist_tasks(next_tasks, "Įrašas išsaugotas.", tg_msg=tg_text)
 
-    def delete_task_click(e):
+    def confirm_delete_task_click(e):
         if state["is_saving"] or not state["edit_id"]:
             return
         state["is_saving"] = True
         save_btn.disabled = True
+        delete_dialog.open = False
         task_dialog.open = False
 
         removed = next((t for t in state["tasks"] if t.get("id") == state["edit_id"]), None)
@@ -611,6 +643,35 @@ def main(page: ft.Page):
         rem_time = removed.get("time", "") if removed else ""
         tg_text = f"{state['user']} pašalino: {rem_client} ({rem_date} {rem_time})"
         persist_tasks(next_tasks, "Įrašas ištrintas.", tg_msg=tg_text)
+
+    def delete_task_click(e):
+        if not state["edit_id"]:
+            return
+        existing = next((t for t in state["tasks"] if t.get("id") == state["edit_id"]), None)
+        c_name = existing.get("client", "įrašą") if existing else "įrašą"
+        c_slot = f"{existing.get('date', '')} {existing.get('time', '')}".strip() if existing else ""
+        delete_confirm_text.value = (
+            f"Ar tikrai norite ištrinti „{c_name}“"
+            + (f" ({c_slot})?" if c_slot else "?")
+        )
+        delete_dialog.open = True
+        page.update()
+
+    delete_dialog = ft.AlertDialog(
+        modal=True,
+        title=ft.Text("Patvirtinti trynimą", size=17, weight=ft.FontWeight.BOLD),
+        content=delete_confirm_text,
+        actions=[
+            ft.Button("Atšaukti", on_click=close_delete_confirm),
+            ft.Button(
+                "Taip, trinti",
+                bgcolor="#dc2626",
+                color="#ffffff",
+                on_click=confirm_delete_task_click,
+            ),
+        ],
+    )
+    page.overlay.append(delete_dialog)
 
     delete_btn = ft.Button(
         "Trinti",
@@ -739,10 +800,32 @@ def main(page: ft.Page):
         state["show_extra"] = bool(e.control.value)
         render_schedule()
 
+    def on_search_change(e: ft.ControlEvent):
+        state["search"] = (e.control.value or "").strip().lower()
+        render_schedule()
+
+    def clear_search_click(e):
+        state["search"] = ""
+        search_input.value = ""
+        render_schedule()
+
     extra_switch = ft.Switch(
         label="Papildomi laikai (08:00 ir 17:00–19:00)",
         value=False,
         on_change=on_extra_toggle,
+    )
+    search_input = ft.TextField(
+        label="Paieška (klientas, auto, tel.)",
+        value="",
+        border_radius=10,
+        height=44,
+        content_padding=ft.Padding.symmetric(horizontal=12, vertical=6),
+        on_change=on_search_change,
+        suffix=ft.IconButton(
+            icon=ft.Icons.CLEAR,
+            icon_size=18,
+            on_click=clear_search_click,
+        ),
     )
 
     def section_divider(title: str, bg: str, fg: str):
@@ -753,114 +836,196 @@ def main(page: ft.Page):
             content=ft.Text(title, size=12, weight=ft.FontWeight.BOLD, color=fg),
         )
 
-    def build_slot_row(slot: str, starts_by_slot: dict[str, list[dict]], is_extra: bool):
-        matched = starts_by_slot.get(slot, [])
-        if matched:
-            row_controls = []
-            for item in matched:
-                st_key = item.get("status", "planned")
-                if st_key not in STATUS_INFO:
-                    st_key = "planned"
-                st_label, st_bg, st_fg, st_border = STATUS_INFO[st_key]
-                is_done = st_key == "done"
-                phone_val = (item.get("phone") or "").strip()
+    def build_task_card(item: dict, slot_label: str, is_past: bool):
+        st_key = item.get("status", "planned")
+        if st_key not in STATUS_INFO:
+            st_key = "planned"
+        st_label, st_bg, st_fg, st_border = STATUS_INFO[st_key]
+        is_done = st_key == "done"
+        phone_val = (item.get("phone") or "").strip()
 
-                action_row_items = [
-                    ft.Text(f"Įrašė: {item.get('by') or '-'}", size=11, color="#64748b"),
+        card_bg = "#f1f5f9" if is_past else ("#f0fdf4" if is_done else "#eff6ff")
+        card_opacity = 0.68 if is_past else 1.0
+
+        action_row_items = [
+            ft.Text(f"Įrašė: {item.get('by') or '-'}", size=11, color="#64748b"),
+            ft.Row(
+                spacing=6,
+                controls=[
+                    ft.Button(
+                        f"Skambinti ({phone_val})",
+                        height=30,
+                        bgcolor="#dcfce7",
+                        color="#166534",
+                        on_click=lambda e, ph=phone_val: page.run_task(call_client, ph),
+                    )
+                    if phone_val
+                    else ft.Container(width=0),
+                    ft.Text("Koreguoti", size=12, weight=ft.FontWeight.W_600, color="#1d4ed8"),
+                ],
+            ),
+        ]
+
+        return ft.Container(
+            padding=12,
+            border_radius=12,
+            bgcolor=card_bg,
+            opacity=card_opacity,
+            border=ft.Border.all(1.5, "#cbd5e1" if is_past else st_border),
+            on_click=lambda e, rec=item: open_task_modal(rec.get("time", "09:00"), rec),
+            content=ft.Column(
+                spacing=6,
+                controls=[
                     ft.Row(
-                        spacing=6,
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                         controls=[
-                            ft.Button(
-                                f"Skambinti ({phone_val})",
-                                height=30,
-                                bgcolor="#dcfce7",
-                                color="#166534",
-                                on_click=lambda e, ph=phone_val: page.run_task(call_client, ph),
-                            )
-                            if phone_val
-                            else ft.Container(width=0),
-                            ft.Text("Koreguoti", size=12, weight=ft.FontWeight.W_600, color="#1d4ed8"),
+                            ft.Text(
+                                slot_label,
+                                weight=ft.FontWeight.BOLD,
+                                size=14,
+                                color="#475569" if is_past else "#0f172a",
+                            ),
+                            ft.Container(
+                                padding=ft.Padding.symmetric(horizontal=10, vertical=4),
+                                border_radius=999,
+                                bgcolor=st_bg,
+                                border=ft.Border.all(1, st_border),
+                                on_click=lambda e, tid=item.get("id"): cycle_task_status(tid),
+                                content=ft.Text(
+                                    st_label,
+                                    size=12,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=st_fg,
+                                ),
+                            ),
                         ],
                     ),
-                ]
+                    ft.Text(
+                        item.get("client", ""),
+                        weight=ft.FontWeight.BOLD,
+                        size=15,
+                        color="#334155" if is_past else "#0f172a",
+                    ),
+                    ft.Text(f"Tel.: {phone_val}", size=13, weight=ft.FontWeight.W_600, color="#0f172a")
+                    if phone_val
+                    else ft.Container(height=0),
+                    ft.Text(item.get("notes", ""), size=13, color="#334155")
+                    if item.get("notes")
+                    else ft.Container(height=0),
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                        controls=action_row_items,
+                    ),
+                ],
+            ),
+        )
 
-                row_controls.append(
-                    ft.Container(
-                        padding=12,
-                        border_radius=12,
-                        bgcolor="#f0fdf4" if is_done else "#eff6ff",
-                        border=ft.Border.all(1.5, st_border),
-                        on_click=lambda e, rec=item: open_task_modal(rec.get("time", "09:00"), rec),
-                        content=ft.Column(
-                            spacing=6,
-                            controls=[
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    controls=[
-                                        ft.Text(
-                                            slot,
-                                            weight=ft.FontWeight.BOLD,
-                                            size=14,
-                                            color="#0f172a",
-                                        ),
-                                        ft.Container(
-                                            padding=ft.Padding.symmetric(horizontal=10, vertical=4),
-                                            border_radius=999,
-                                            bgcolor=st_bg,
-                                            border=ft.Border.all(1, st_border),
-                                            on_click=lambda e, tid=item.get("id"): cycle_task_status(tid),
-                                            content=ft.Text(
-                                                st_label,
-                                                size=12,
-                                                weight=ft.FontWeight.BOLD,
-                                                color=st_fg,
-                                            ),
-                                        ),
-                                    ],
-                                ),
-                                ft.Text(
-                                    item.get("client", ""),
-                                    weight=ft.FontWeight.BOLD,
-                                    size=15,
-                                    color="#0f172a",
-                                ),
-                                ft.Text(f"Tel.: {phone_val}", size=13, weight=ft.FontWeight.W_600, color="#0f172a")
-                                if phone_val
-                                else ft.Container(height=0),
-                                ft.Text(item.get("notes", ""), size=13, color="#334155")
-                                if item.get("notes")
-                                else ft.Container(height=0),
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                    controls=action_row_items,
-                                ),
-                            ],
-                        ),
-                    )
-                )
-            return row_controls
+    def build_slot_row(slot: str, starts_by_slot: dict[str, list[dict]], is_extra: bool):
+        matched = starts_by_slot.get(slot, [])
+        is_past = is_past_slot_for_date(state["date"], slot)
+        if matched:
+            return [build_task_card(item, slot, is_past) for item in matched]
+
+        free_bg = "#f1f5f9" if is_past else ("#fffbeb" if is_extra else "#ffffff")
+        free_border = "#cbd5e1" if is_past else ("#fcd34d" if is_extra else "#cbd5e1")
+        free_label = "Praėjęs laikas" if is_past else ("+ Papildomas laikas" if is_extra else "+ Laisvas laikas")
+        free_color = "#64748b" if is_past else "#15803d"
 
         return [
             ft.Container(
                 padding=12,
                 border_radius=12,
-                bgcolor="#fffbeb" if is_extra else "#ffffff",
-                border=ft.Border.all(1, "#fcd34d" if is_extra else "#cbd5e1"),
+                bgcolor=free_bg,
+                opacity=0.68 if is_past else 1.0,
+                border=ft.Border.all(1, free_border),
                 on_click=lambda e, s=slot: open_task_modal(s, None),
                 content=ft.Row(
                     alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                     controls=[
-                        ft.Text(slot, weight=ft.FontWeight.BOLD, color="#1e293b"),
-                        ft.Text("+ Papildomas laikas" if is_extra else "+ Laisvas laikas", size=13, color="#15803d"),
+                        ft.Text(slot, weight=ft.FontWeight.BOLD, color="#64748b" if is_past else "#1e293b"),
+                        ft.Text(free_label, size=13, color=free_color),
                         ft.Text("Įrašyti", size=12, color="#64748b"),
                     ],
                 ),
             )
         ]
 
+    def update_occupancy_badge(day_items: list[dict], starts_by_slot: dict[str, list[dict]], visible_slots: list[str]):
+        total_slots = len(visible_slots)
+        occupied_slots = sum(1 for s in visible_slots if s in starts_by_slot)
+        free_slots = max(0, total_slots - occupied_slots)
+        txt_control = occupancy_badge.content
+
+        if not day_items:
+            txt_control.value = f"Laisva diena • 0/{total_slots} užimta • {free_slots} laisvų"
+            txt_control.color = "#166534"
+            occupancy_badge.bgcolor = "#dcfce7"
+            occupancy_badge.border = ft.Border.all(1, "#86efac")
+        elif free_slots == 0:
+            txt_control.value = f"Pilnai užimta • {occupied_slots}/{total_slots} ({len(day_items)} įraš.)"
+            txt_control.color = "#9a3412"
+            occupancy_badge.bgcolor = "#ffedd5"
+            occupancy_badge.border = ft.Border.all(1, "#fdba74")
+        else:
+            txt_control.value = f"Užimta: {occupied_slots}/{total_slots} ({len(day_items)} įraš.) • Laisva: {free_slots}"
+            txt_control.color = "#1e40af"
+            occupancy_badge.bgcolor = "#dbeafe"
+            occupancy_badge.border = ft.Border.all(1, "#93c5fd")
+
+    def render_search_results(query: str):
+        date_label.value = f"Paieška: „{query}“"
+        matches = []
+        for t in state["tasks"]:
+            haystack = " ".join(
+                [
+                    str(t.get("client") or ""),
+                    str(t.get("phone") or ""),
+                    str(t.get("notes") or ""),
+                    str(t.get("date") or ""),
+                    str(t.get("time") or ""),
+                ]
+            ).lower()
+            if query in haystack:
+                matches.append(t)
+
+        matches.sort(key=lambda x: (str(x.get("date") or ""), str(x.get("time") or "")))
+        txt_control = occupancy_badge.content
+        txt_control.value = f"Paieškos rezultatų: {len(matches)}"
+        txt_control.color = "#1e40af"
+        occupancy_badge.bgcolor = "#dbeafe"
+        occupancy_badge.border = ft.Border.all(1, "#93c5fd")
+
+        controls = [section_divider(f"RASTA ĮRAŠŲ: {len(matches)}", "#dbeafe", "#1e40af")]
+
+        if not matches:
+            controls.append(
+                ft.Container(
+                    padding=16,
+                    border_radius=12,
+                    bgcolor="#ffffff",
+                    border=ft.Border.all(1, "#cbd5e1"),
+                    content=ft.Text("Pagal paiešką įrašų nerasta.", size=13, color="#475569"),
+                )
+            )
+        else:
+            for item in matches:
+                d_str = str(item.get("date") or "")
+                t_str = str(item.get("time") or "09:00")
+                slot_title = f"{d_str} • {t_str}".strip(" •")
+                past_flag = is_past_slot_for_date(d_str, t_str) if d_str else False
+                controls.append(build_task_card(item, slot_title, past_flag))
+
+        slots_column.controls = controls
+        page.update()
+
     def render_schedule():
         header_title.value = f"GRAFIKAS • {sanitize_room(state['room'])}"
         header_sub.value = f"Naudotojas: {state['user']}"
+
+        if state["search"]:
+            render_search_results(state["search"])
+            return
+
         date_label.value = f"Data: {state['date']}  (braukite keisti dienai)"
 
         day_items = [t for t in state["tasks"] if t.get("date") == state["date"]]
@@ -872,33 +1037,40 @@ def main(page: ft.Page):
 
         occupied_all = set(starts_by_slot.keys())
         controls = []
+        visible_slots = []
 
         if state["show_extra"]:
             controls.append(section_divider("PAPILDOMAS LAIKAS (NUO 08:00)", "#fef3c7", "#92400e"))
             for slot in extra_morning_slots():
+                visible_slots.append(slot)
                 controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
         else:
             active_morning = [s for s in extra_morning_slots() if s in occupied_all]
             if active_morning:
                 controls.append(section_divider("PAPILDOMAS LAIKAS (NUO 08:00)", "#fef3c7", "#92400e"))
                 for slot in active_morning:
+                    visible_slots.append(slot)
                     controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
 
         controls.append(section_divider("DARBO LAIKAS (09:00–17:00, PIETŪS 13:00–14:00)", "#dbeafe", "#1e40af"))
         for slot in work_slots():
+            visible_slots.append(slot)
             controls.extend(build_slot_row(slot, starts_by_slot, is_extra=False))
 
         if state["show_extra"]:
             controls.append(section_divider("PAPILDOMAS LAIKAS (17:00–19:00)", "#fef3c7", "#92400e"))
             for slot in extra_evening_slots():
+                visible_slots.append(slot)
                 controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
         else:
             active_evening = [s for s in extra_evening_slots() if s in occupied_all]
             if active_evening:
                 controls.append(section_divider("PAPILDOMAS LAIKAS (17:00–19:00)", "#fef3c7", "#92400e"))
                 for slot in active_evening:
+                    visible_slots.append(slot)
                     controls.extend(build_slot_row(slot, starts_by_slot, is_extra=True))
 
+        update_occupancy_badge(day_items, starts_by_slot, visible_slots)
         slots_column.controls = controls
         page.update()
 
@@ -967,7 +1139,7 @@ def main(page: ft.Page):
             state["swipe_dx"] = 0.0
 
         page.floating_action_button = ft.FloatingActionButton(
-            content=ft.Text("+ Naujas užsakymas", color="#ffffff", weight=ft.FontWeight.BOLD),
+            content=ft.Icon(ft.Icons.ADD, color="#ffffff", size=28),
             bgcolor="#2563eb",
             on_click=lambda e: open_task_modal(None, None),
         )
@@ -1015,12 +1187,15 @@ def main(page: ft.Page):
                     ),
                 ),
                 ft.Container(
-                    padding=ft.Padding.symmetric(horizontal=14, vertical=6),
+                    width=float("inf"),
+                    padding=ft.Padding.symmetric(horizontal=14, vertical=8),
                     bgcolor="#e2e8f0",
                     content=ft.Column(
-                        spacing=4,
+                        spacing=6,
                         controls=[
                             date_label,
+                            occupancy_badge,
+                            search_input,
                             extra_switch,
                         ],
                     ),
